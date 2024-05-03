@@ -31,10 +31,10 @@ using namespace std;
   at the server and the data necesary about it
 */
 struct tcp_client {
-  char id[11];
-  int fd;
-  vector<pair<char*, int>> subscriptions;
-  int connected;
+    int fd;
+    bool connected;
+    char id[11];  // Assuming ID is a string of 10 characters + null terminator
+    vector<pair<char *, int>> subscriptions;  // Change to std::string from char*
 };
 
 /*

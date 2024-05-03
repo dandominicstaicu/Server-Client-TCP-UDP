@@ -39,6 +39,8 @@ bool match_topic(const char* subscription, const char* topic) {
             if (*(subscription + 1) == '\0') // '*' at the end matches all remaining characters
                 return true;
             subscription++;
+            if (*topic == '\0') // If topic ends but subscription still has '*', no match
+                return false;
             while (*topic != '\0') { // Try all possible matches
                 if (match_topic(subscription, topic))
                     return true;
@@ -46,15 +48,18 @@ bool match_topic(const char* subscription, const char* topic) {
             }
             return false; // No match found
         } else if (*subscription == '+') {
-            const char* next_slash = strchr(topic, '/');
-            if (next_slash != nullptr) {
-                topic = next_slash;
-                subscription++;
-            } else {
-                if (*(subscription + 1) == '\0' && *(topic + strlen(topic)) == '\0') // End with '+'
-                    return true;
+            if (*(subscription + 1) != '/' && *(subscription + 1) != '\0') // Ensure '+' is followed by '/' or end of string
                 return false;
+            const char* next_slash = strchr(topic, '/');
+            if (next_slash != nullptr) { // '+' matches until next '/'
+                topic = next_slash;
+            } else { // If no '/' found, match till end if '+' is at end of subscription
+                if (*(subscription + 1) == '\0')
+                    topic += strlen(topic); // Move to end of topic
+                else
+                    return false; // If '+' not at end and no '/', no match
             }
+            subscription++;
         } else if (*subscription == *topic) {
             subscription++;
             topic++;
@@ -66,16 +71,53 @@ bool match_topic(const char* subscription, const char* topic) {
     return *subscription == '\0' && *topic == '\0';
 }
 
-
 /*
     Check if a topic is in the list of subscribers of a client:
     if it's not subscribed, return 0
     if it's subscribed without store-forward, return 1
     if it's subscribed with store-forward, return 2
 */
+bool is_more_inclusive(const char* new_sub, const char* existing_sub) {
+    // Simple check: if new_sub ends with '*' and existing_sub ends with '+'
+    int new_len = strlen(new_sub);
+    int existing_len = strlen(existing_sub);
+    if (new_sub[new_len - 1] == '*' && existing_sub[existing_len - 1] == '+') {
+        // Compare the base part of the subscription without the last character
+        return strncmp(new_sub, existing_sub, new_len - 1) == 0;
+    }
+    return false;
+}
+
+bool update_subscriptions(vector<pair<char *, int>>& subscriptions, const char *topic, int sf) {
+    bool updated = false;  // Flag to indicate if a new subscription is added or an existing one is updated
+
+    // Check if a more inclusive subscription exists
+    for (auto& sub : subscriptions) {
+        if (is_more_inclusive(topic, sub.first)) {
+            // Replace existing subscription with more inclusive one
+            free(sub.first);  // Assume dynamic allocation
+            sub.first = strdup(topic);
+            sub.second = sf;
+            return true;  // Return true as the subscription list was updated
+        }
+    }
+
+    // Check if the exact same subscription already exists
+    for (auto& sub : subscriptions) {
+        if (strcmp(sub.first, topic) == 0 && sub.second == sf) {
+            return false;  // Subscription already exists with the same settings
+        }
+    }
+
+    // If no more inclusive or exact same subscription is found, add the new one
+    subscriptions.push_back({strdup(topic), sf});
+    return true;  // Return true as a new subscription was added
+}
+
+
 int check_subscribed(const vector<pair<char *, int>>& subscriptions, const char *topic) {
     for (auto& sub : subscriptions) {
-        if (match_topic(sub.first, topic))
+        if (strcmp(sub.first, topic) == 0 || match_topic(sub.first, topic))
             return 1 + sub.second;
     }
     return 0;
@@ -383,37 +425,27 @@ void run_server(int udp_sockfd, int tcp_sockfd) {
                         int sf;
                         sscanf(buf, "%s %s %d", sub, topic, &sf);
 
-                        // Daca am primit o cerere de subscribe
-                        if (!strcmp(sub, "subscribe"))
-                        {   
-                            int subscribed = 0;
+                        // If a subscribe request is received
+                        if (!strcmp(sub, "subscribe")) {
+                            bool subscribed = false;
 
-                            // Caut clientul care a trimis cererea (dupa fd)
-                            for (int k = 0; k < num_tcp_clients; k++)
-                            {
-                                if (tcp_clients[k].fd == poll_fds[i].fd)
-                                { 
-                                    // Verific sa nu fie deja abonat la topic
-                                    if (check_subscribed(tcp_clients[k].subscriptions, topic) == 0)
-                                    {
-                                        tcp_clients[k].subscriptions.push_back({strdup(topic), sf});
-                                        subscribed = 1;
-                                    }
-                                    else
+                            // Find the client who sent the request (by file descriptor)
+                            for (int k = 0; k < num_tcp_clients; k++) {
+                                if (tcp_clients[k].fd == poll_fds[i].fd) {
+                                    // Update subscriptions; this function now also checks for existing subscriptions
+                                    subscribed = update_subscriptions(tcp_clients[k].subscriptions, topic, sf);
+
+                                    if (subscribed) {
+                                        // Send a confirmation message to the client
+                                        memset(buf, 0, MAX_BUF_SIZE);
+                                        sprintf(buf, "Subscribed to topic %s.\n", topic);
+                                        int send_result = send_all(poll_fds[i].fd, &buf, MAX_BUF_SIZE);
+                                        DIE(send_result < 0, "send");
+                                    } else {
                                         fprintf(stderr, "Already subscribed to topic %s\n", topic);
-
+                                    }
                                     break;
                                 }
-                            }
-
-                            if (subscribed)
-                            {
-                                // Trimit mesajul de confirmare catre client
-                                memset(buf, 0, MAX_BUF_SIZE);
-                                sprintf(buf, "Subscribed to topic.\n");
-
-                                rc = send_all(poll_fds[i].fd, &buf, MAX_BUF_SIZE);
-                                DIE(rc < 0, "send");
                             }
                         }
                         // Daca am primit o cerere de unsubscribe
@@ -459,6 +491,39 @@ void run_server(int udp_sockfd, int tcp_sockfd) {
 			}
 		}
 	}
+}
+
+bool test_match_topic() {
+    struct TestCase {
+        const char* pattern;
+        const char* topic;
+        bool expected;
+    };
+
+    TestCase tests[] = {
+        {"+/ec/100/pressure", "upb/ec/100/pressure", true},
+        {"+/ec/100/pressure", "upb/xyz/ec/100/pressure", false},
+        {"upb/+/100/pressure", "upb/ec/100/pressure", true},
+        {"upb/*/pressure", "upb/ec/100/pressure", true},
+        {"upb/*", "upb/ec/100/pressure", true},
+        {"upb/+/100/pressure", "upb/100/pressure", false},  // Should fail, as '+' requires one segment
+        {"upb/*/pressure", "upb/100/extra/pressure", true}, // '*' can span multiple segments
+        {"upb/precis/100/*", "upb/precis/100/extra/pressure", true},
+        {"upb/precis/100/*", "upb/precis/100/extra", true},
+        {"upb/precis/100/*", "upb/precis/100/+", true},
+        {"upb/precis/100/+", "upb/precis/100/*", true},
+    };
+
+    bool success = true;
+    for (const auto& test : tests) {
+        bool result = match_topic(test.pattern, test.topic);
+        if (result != test.expected) {
+            std::cerr << "Failed: Pattern \"" << test.pattern << "\" with Topic \"" << test.topic
+                      << "\" should be " << (test.expected ? "true" : "false") << "\n";
+            success = false;
+        }
+    }
+    return success;
 }
 
 int main(int argc, char *argv[]) {
@@ -509,5 +574,13 @@ int main(int argc, char *argv[]) {
 
 	run_server(udp_sockfd, tcp_sockfd);
 
+    // if (test_match_topic()) {
+    //     std::cout << "All tests passed.\n";
+    // } else {
+    //     std::cout << "Some tests failed.\n";
+    // }
+
+
 	return 0;
 }
+
